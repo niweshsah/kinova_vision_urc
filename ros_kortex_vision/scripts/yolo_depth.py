@@ -51,7 +51,6 @@ class YOLOv5ROSNode:
             self.depth_image = None
 
     def image_callback(self, msg):
-        """ Processes RGB image and performs YOLOv5 inference """
         try:
             # Convert ROS Image to OpenCV format
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -61,59 +60,74 @@ class YOLOv5ROSNode:
             # Perform object detection
             results = self.model(cv_image)
 
-            # Render detections on the image
-            rendered_image = results.render()[0].copy()  # Make a writable copy
+            # Render detections on the RGB image
+            rendered_image = cv_image.copy()  # Start with original image
 
             if self.depth_image is not None:
-                # Get dimensions of RGB and Depth images
-                if self.depth_image is not None:
-                    min_depth = np.min(self.depth_image)
-                    max_depth = np.max(self.depth_image)
-                    rospy.loginfo(f"Depth Range: {min_depth:.2f}m to {max_depth:.2f}m")
+                min_depth = np.min(self.depth_image)
+                max_depth = np.max(self.depth_image)
+                rospy.loginfo(f"Depth Range: {min_depth:.2f}m to {max_depth:.2f}m")
 
-                
-                height_rgb, width_rgb = cv_image.shape[:2]
-                height_depth, width_depth = self.depth_image.shape[:2]
+                # Normalize and apply colormap to depth image for visualization
+                depth_vis = cv2.normalize(self.depth_image, None, 0, 255, cv2.NORM_MINMAX)
+                depth_vis = np.uint8(depth_vis)
+                depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
 
-                # Scale factors (if depth and RGB resolutions differ)
-                scale_x = width_depth / width_rgb
-                scale_y = height_depth / height_rgb
+            height_rgb, width_rgb = cv_image.shape[:2]
+            height_depth, width_depth = self.depth_image.shape[:2]
 
-                for *xyxy, conf, cls in results.xyxy[0]:  # Bounding box coordinates
-                    x1, y1, x2, y2 = map(int, xyxy)
-                    center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+            scale_x = width_depth / width_rgb
+            scale_y = height_depth / height_rgb
 
-                    # Scale to depth image resolution
-                    center_x = int(center_x * scale_x)
-                    center_y = int(center_y * scale_y)
+            for *xyxy, conf, cls in results.xyxy[0]:  # Bounding box coordinates
+                if int(cls) != 41:  # Only process "cup"
+                    continue
 
-                    # Ensure valid depth image coordinates
-                    if 0 <= center_x < width_depth and 0 <= center_y < height_depth:
-                        depth_value = self.depth_image[center_y, center_x]
-                    else:
-                        depth_value = -1  # Invalid depth
+                x1, y1, x2, y2 = map(int, xyxy)
 
-                    # Log depth information
-                    rospy.loginfo(f"center_x: {center_x}, center_y: {center_y}, Depth: {depth_value:.2f}m")
+                # Center in RGB image coordinates
+                center_x_rgb, center_y_rgb = (x1 + x2) // 2, (y1 + y2) // 2
 
-                    # Draw depth information on bottom right of bounding box in red
-                    text = f"{depth_value:.2f}m"
-                    text_x, text_y = x2 - 60, y2 - 10  # Bottom-right of the bounding box
-                    cv2.putText(rendered_image, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 
-                                0.5, (0, 0, 255), 2)  # Red color (BGR: (0,0,255))
+                # Scale to depth image resolution
+                center_x_depth = int(center_x_rgb * scale_x)
+                center_y_depth = int(center_y_rgb * scale_y)
 
-            # Convert the annotated image back to a ROS Image message
+                # Ensure valid depth image coordinates
+                if 0 <= center_x_depth < width_depth and 0 <= center_y_depth < height_depth:
+                    depth_value = self.depth_image[center_y_depth, center_x_depth]
+                else:
+                    depth_value = -1  # Invalid depth
+
+                rospy.loginfo(f"Cup detected at RGB({center_x_rgb}, {center_y_rgb}) -> Depth({center_x_depth}, {center_y_depth}), Depth: {depth_value:.2f}m")
+
+                # Draw bounding box in RGB image
+                cv2.rectangle(rendered_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.circle(rendered_image, (center_x_rgb, center_y_rgb), 5, (255, 0, 0), -1)  # Blue dot
+
+                # Draw bounding box in Depth Image
+                cv2.rectangle(depth_vis_colored, (center_x_depth - 10, center_y_depth - 10), 
+                            (center_x_depth + 10, center_y_depth + 10), (0, 255, 255), 2)  # Yellow box
+                cv2.circle(depth_vis_colored, (center_x_depth, center_y_depth), 5, (255, 0, 0), -1)  # Blue dot
+
+                # Depth information text
+                text = f"{depth_value:.2f}m"
+                cv2.putText(rendered_image, text, (x2 - 60, y2 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                cv2.putText(depth_vis_colored, text, (center_x_depth, center_y_depth - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+            # Convert and publish annotated image
             annotated_image_msg = self.bridge.cv2_to_imgmsg(rendered_image, "bgr8")
-
-            # Publish the annotated image (optional)
             self.image_pub.publish(annotated_image_msg)
 
-            # Display the annotated image (optional)
-            cv2.imshow("YOLOv5 Detection", rendered_image)
+            # Display the annotated images
+            cv2.imshow("YOLOv5 Detection - Cups Only", rendered_image)
+            cv2.imshow("Depth Image with Detections", depth_vis_colored)
             cv2.waitKey(1)
 
         except Exception as e:
             rospy.logerr(f"Error processing image: {e}")
+
+
+
 
 if __name__ == '__main__':
     try:
