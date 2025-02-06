@@ -31,7 +31,7 @@
        doc="URL of custom calibration file for depth camera.
             See camera_info_manager docs for calibration URL details." />
 
-  <arg name="depth_registration" default="true"
+  <arg name="depth_registration" default="false"
        doc="Hardware depth registration" />
 
   <!-- Arguments for remapping all device namespaces -->
