@@ -72,6 +72,7 @@ class YOLOv5ROSNode:
                     if (0 <= u_depth < 480 and 0 <= v_depth < 270):
                         depth_value = self.depth_image[v_depth, u_depth]
                         x, y, z = self.compute_3d_coordinates(u_depth, v_depth, depth_value)
+                        
                     else:
                         depth_value = -1
                         x, y, z = None, None, None
