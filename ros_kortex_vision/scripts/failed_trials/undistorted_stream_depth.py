@@ -6,7 +6,7 @@ import numpy as np
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 from ultralytics import YOLO
-from radialTangentialDistortion import RadialTangentialDistortion, PinholeCamera
+from ros_kortex_vision.scripts.failed_trials.radialTangentialDistortion import RadialTangentialDistortion, PinholeCamera
 
 class ObjectDepthEstimator:
     def __init__(self):
