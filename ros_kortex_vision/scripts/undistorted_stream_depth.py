@@ -2,6 +2,7 @@
 
 import rospy
 from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo  # Import CameraInfo message
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -11,6 +12,7 @@ from ultralytics import YOLO
 from radialTangentialDistortion import RadialTangentialDistortion, PinholeCamera
 
 class YOLOv8DepthNode:
+
     def __init__(self):
         # Initialize ROS node
         rospy.init_node('yolov8_depth_node', anonymous=True)
@@ -21,9 +23,10 @@ class YOLOv8DepthNode:
         # Initialize CV Bridge
         self.bridge = CvBridge()
 
-        # Subscribe to RGB and Depth camera topics
+        # Subscribe to RGB, Depth, and CameraInfo topics
         self.image_sub = rospy.Subscriber("/camera/color/image_raw", Image, self.image_callback)
         self.depth_sub = rospy.Subscriber("/camera/depth/image_raw", Image, self.depth_callback)
+        self.camera_info_sub = rospy.Subscriber("/camera/color/camera_info", CameraInfo, self.camera_info_callback)  # Subscribe to CameraInfo
 
         # Publisher for annotated image (optional)
         self.image_pub = rospy.Publisher("/yolo/detected_image", Image, queue_size=10)
@@ -32,9 +35,44 @@ class YOLOv8DepthNode:
         self.depth_image = None
         self.depth_encoding = None
 
-        # Initialize the pinhole camera model with distortion parameters
-        self.distortion = RadialTangentialDistortion(-0.3, 0.1, -0.0001, -0.00005)
-        self.pinhole_camera = PinholeCamera(640, 480, 450, 450, 319.5, 239.5, self.distortion)
+        # Initialize camera parameters to default values. These will be updated by camera_info_callback
+        self.width = 640
+        self.height = 480
+        self.k1 = 0.0
+        self.k2 = 0.0
+        self.p1 = 0.0
+        self.p2 = 0.0
+        self.fx = 400.0
+        self.fy = 400.0
+        self.cx = 320.0
+        self.cy = 240.0
+
+        self.distortion = RadialTangentialDistortion(self.k1, self.k2, self.p1, self.p2)
+        self.pinhole_camera = PinholeCamera(self.width, self.height, self.fx, self.fy, self.cx, self.cy, self.distortion)
+
+
+    def camera_info_callback(self, msg):
+        """ Callback function to update camera parameters from CameraInfo message """
+        self.width = msg.width
+        self.height = msg.height
+
+        # Extract distortion parameters
+        self.k1 = msg.D[0] if len(msg.D) > 0 else 0.0
+        self.k2 = msg.D[1] if len(msg.D) > 1 else 0.0
+        self.p1 = msg.D[2] if len(msg.D) > 2 else 0.0
+        self.p2 = msg.D[3] if len(msg.D) > 3 else 0.0
+
+        # Extract camera intrinsics
+        self.fx = msg.K[0]
+        self.fy = msg.K[4]
+        self.cx = msg.K[2]
+        self.cy = msg.K[5]
+
+        # Update the distortion and pinhole camera objects
+        self.distortion = RadialTangentialDistortion(self.k1, self.k2, self.p1, self.p2)
+        self.pinhole_camera = PinholeCamera(self.width, self.height, self.fx, self.fy, self.cx, self.cy, self.distortion)
+
+        rospy.loginfo("Camera parameters updated from CameraInfo message")
 
     def depth_callback(self, msg):
         """ Stores the latest depth image """
@@ -51,8 +89,8 @@ class YOLOv8DepthNode:
                 rospy.logwarn(f"Unsupported depth encoding: {self.depth_encoding}")
                 self.depth_image = None
 
-            rospy.loginfo(f"Depth image shape: {self.depth_image.shape}")
-
+            if self.depth_image is not None:
+                rospy.loginfo(f"Depth image shape: {self.depth_image.shape}")
         except Exception as e:
             rospy.logerr(f"Error processing depth image: {e}")
             self.depth_image = None
@@ -61,7 +99,6 @@ class YOLOv8DepthNode:
         try:
             # Convert ROS Image to OpenCV format
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            
             rospy.loginfo(f"RGB image shape: {cv_image.shape}")
 
             # Undistort the RGB image using the pinhole camera model
@@ -83,51 +120,54 @@ class YOLOv8DepthNode:
                 depth_vis = np.uint8(depth_vis)
                 depth_vis_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
 
-            height_rgb, width_rgb = undistorted_image.shape[:2]
-            height_depth, width_depth = self.depth_image.shape[:2]
+                height_rgb, width_rgb = undistorted_image.shape[:2]
+                height_depth, width_depth = self.depth_image.shape[:2]
 
-            scale_x = width_depth / width_rgb
-            scale_y = height_depth / height_rgb
+                if width_rgb > 0 and height_rgb > 0 and width_depth > 0 and height_depth > 0:  # Avoid division by zero
+                    scale_x = float(width_depth) / float(width_rgb)
+                    scale_y = float(height_depth) / float(height_rgb)
 
-            for r in results:
-                boxes = r.boxes
-                for box in boxes:
-                    cls = int(box.cls[0])
-                    if cls != 41:  # Only process "cup"
-                        continue
+                    for r in results:
+                        boxes = r.boxes
+                        for box in boxes:
+                            cls = int(box.cls[0])
+                            if cls != 41:  # Only process "cup"
+                                continue
 
-                    # Bounding box coordinates
-                    x1, y1, x2, y2 = box.xyxy[0]
-                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                            # Bounding box coordinates
+                            x1, y1, x2, y2 = box.xyxy[0]
+                            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
-                    # Center in RGB image coordinates
-                    center_x_rgb, center_y_rgb = (x1 + x2) // 2, (y1 + y2) // 2
+                            # Center in RGB image coordinates
+                            center_x_rgb, center_y_rgb = (x1 + x2) // 2, (y1 + y2) // 2
 
-                    # Scale to depth image resolution
-                    center_x_depth = int(center_x_rgb * scale_x)
-                    center_y_depth = int(center_y_rgb * scale_y)
+                            # Scale to depth image resolution
+                            center_x_depth = int(center_x_rgb * scale_x)
+                            center_y_depth = int(center_y_rgb * scale_y)
 
-                    # Ensure valid depth image coordinates
-                    if 0 <= center_x_depth < width_depth and 0 <= center_y_depth < height_depth:
-                        depth_value = self.depth_image[center_y_depth, center_x_depth]
-                    else:
-                        depth_value = -1  # Invalid depth
+                            # Ensure valid depth image coordinates
+                            if 0 <= center_x_depth < width_depth and 0 <= center_y_depth < height_depth:
+                                depth_value = self.depth_image[center_y_depth, center_x_depth]
+                            else:
+                                depth_value = -1  # Invalid depth
 
-                    rospy.loginfo(f"Cup detected at RGB({center_x_rgb}, {center_y_rgb}) -> Depth({center_x_depth}, {center_y_depth}), Depth: {depth_value:.2f}m")
+                            rospy.loginfo(f"Cup detected at RGB({center_x_rgb}, {center_y_rgb}) -> Depth({center_x_depth}, {center_y_depth}), Depth: {depth_value:.2f}m")
 
-                    # Draw bounding box in RGB image
-                    cv2.rectangle(rendered_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.circle(rendered_image, (center_x_rgb, center_y_rgb), 5, (255, 0, 0), -1)  # Blue dot
+                            # Draw bounding box in RGB image
+                            cv2.rectangle(rendered_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            cv2.circle(rendered_image, (center_x_rgb, center_y_rgb), 5, (255, 0, 0), -1)  # Blue dot
 
-                    # Draw bounding box in Depth Image
-                    cv2.rectangle(depth_vis_colored, (center_x_depth - 10, center_y_depth - 10), 
-                                (center_x_depth + 10, center_y_depth + 10), (0, 255, 255), 2)  # Yellow box
-                    cv2.circle(depth_vis_colored, (center_x_depth, center_y_depth), 5, (255, 0, 0), -1)  # Blue dot
+                            # Draw bounding box in Depth Image
+                            cv2.rectangle(depth_vis_colored, (center_x_depth - 10, center_y_depth - 10),
+                                          (center_x_depth + 10, center_y_depth + 10), (0, 255, 255), 2)  # Yellow box
+                            cv2.circle(depth_vis_colored, (center_x_depth, center_y_depth), 5, (255, 0, 0), -1)  # Blue dot
 
-                    # Depth information text
-                    text = f"{depth_value:.2f}m"
-                    cv2.putText(rendered_image, text, (x2 - 60, y2 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                    cv2.putText(depth_vis_colored, text, (center_x_depth, center_y_depth - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                            # Depth information text
+                            text = f"{depth_value:.2f}m"
+                            cv2.putText(rendered_image, text, (x2 - 60, y2 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                            cv2.putText(depth_vis_colored, text, (center_x_depth, center_y_depth - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                else:
+                    rospy.logwarn("One or more image dimensions are zero, skipping depth processing.")
 
             # Convert and publish annotated image
             annotated_image_msg = self.bridge.cv2_to_imgmsg(rendered_image, "bgr8")
@@ -145,8 +185,8 @@ class YOLOv8DepthNode:
         """ Undistort the image using the pinhole camera model """
         h, w = image.shape[:2]
         map1, map2 = cv2.initUndistortRectifyMap(
-            self.pinhole_camera.camera_matrix, self.pinhole_camera.dist_coeffs, None, None, (w, h), cv2.CV_32FC1
-        )
+            self.pinhole_camera.camera_matrix, self.pinhole_camera.dist_coeffs, None, None, (w, h), cv2.CV_32FC1)
+
         undistorted_image = cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR)
         return undistorted_image
 
