@@ -1,10 +1,13 @@
-# written by Stefan Leutenegger, TU Munich, November 2021
+#!/usr/bin/env python3
+
+import rospy
+import cv2
 import numpy as np
-from matplotlib import pyplot as plt
+from sensor_msgs.msg import Image, CameraInfo
+from cv_bridge import CvBridge
+from ultralytics import YOLO
 from scipy.optimize import minimize
 
-
-# helper class that just does the radial-tangentialDistortion
 class RadialTangentialDistortion:
     def __init__(self, k1, k2, p1, p2, k3=0, k4=0, k5=0, k6=0):
         self.k1 = k1
@@ -48,10 +51,8 @@ class RadialTangentialDistortion:
             uUnDistorted[k, :] = res.x
         return uUnDistorted
 
-
-# now the pinhole camera class
 class PinholeCamera:
-    def __init__(self, width, height, f1, f2, c1, c2, distortion):
+    def __init__(self, width=0, height=0, f1=0, f2=0, c1=0, c2=0, distortion=None):
         self.width = width
         self.height = height
         self.f1 = f1
@@ -60,164 +61,193 @@ class PinholeCamera:
         self.c2 = c2
         self.distortion = distortion
 
-    def project(self, x):
-        x_dash, is_valid = self.p(x)
-        x_ddash = self.d(x_dash)
-        u = self.k(x_ddash)
+class ObjectDepthEstimator:
+    def __init__(self):
+        rospy.init_node('object_depth_estimator', anonymous=True)
 
-        is_valid_index = np.argwhere(is_valid)[:, 0]
-        is_in_image_u = np.logical_and(u[:, 0] >= -0.5, u[:, 0] <= self.width - 0.5)
-        is_in_image_v = np.logical_and(u[:, 1] >= -0.5, u[:, 1] <= self.height - 0.5)
-        is_in_image = np.logical_and(is_in_image_u, is_in_image_v)
-        is_valid[is_valid_index] = is_in_image
+        self.bridge = CvBridge()
+        self.model = YOLO("yolov8n.pt")  # Load YOLOv8 model
 
-        if not np.any(is_valid):
-            return [], is_valid
-        return u[is_in_image, :], is_valid
+        # Hardcoded camera parameters (replace with your actual values)
+        self.image_width = 640  # Example, adjust based on your camera info
+        self.image_height = 480 # Example, adjust based on your camera info
+        self.distortion_model = "plumb_bob"
+        self.D = [0.0, 0.0, 0.0, 0.0, 0.0]
+        self.K = [1297.672904, 0.0, 620.914026, 0.0, 1298.631344, 238.280325, 0.0, 0.0, 1.0]
+        self.R = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        self.P = [1297.008057, 0.0, 620.336773, 0.0, 0.0, 1304.157593, 238.813876, 0.0, 0.0, 0.0, 1.0, 0.0]
+        self.binning_x = 0
+        self.binning_y = 0
+        self.roi_x_offset = 0
+        self.roi_y_offset = 0
+        self.roi_height = 0
+        self.roi_width = 0
+        self.roi_do_rectify = False
 
-    def p(self, x):
-        is_z_positive = x[:, 2] > 1e-10
-        u = x[is_z_positive, 0] / x[is_z_positive, 2]
-        v = x[is_z_positive, 1] / x[is_z_positive, 2]
-        return np.stack([u, v], axis=1), is_z_positive
+        # Initialize camera parameters (use hardcoded values)
+        # Extract focal lengths and principal point from K matrix
+        fx = self.K[0]
+        fy = self.K[4]
+        cx = self.K[2]
+        cy = self.K[5]
 
-    def p_inverse(self, x_dash):
-        return np.stack(
-            [x_dash[:, 0], x_dash[:, 1], np.ones(np.size(x_dash[:, 0]))], axis=1
-        )
+        # Initialize RadialTangentialDistortion with your D values
+        self.distortion = RadialTangentialDistortion(k1=self.D[0], k2=self.D[1], p1=self.D[2], p2=self.D[3], k3=self.D[4])
 
-    def d(self, x_dash):
-        return self.distortion.distort(x_dash)
+        self.camera = PinholeCamera(width=self.image_width, height=self.image_height, f1=fx, f2=fy, c1=cx, c2=cy, distortion=self.distortion)
 
-    def d_inverse(self, x_ddash):
-        return self.distortion.undistort(x_ddash)
+        self.camera_matrix = np.array(self.K).reshape((3, 3))
+        self.dist_coeffs = np.array(self.D)
 
-    def k(self, x_ddash):
-        u = self.f1 * x_ddash[:, 0] + self.c1
-        v = self.f2 * x_ddash[:, 1] + self.c2
-        return np.stack([u, v], axis=1)
+        # Set default value, will be overwritten if camera_info is called.
+        self.new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(self.camera_matrix, self.dist_coeffs, (self.image_width, self.image_height), 1, (self.image_width, self.image_height))
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(self.camera_matrix, self.dist_coeffs, None, self.new_camera_matrix, (self.image_width, self.image_height), cv2.CV_32FC1)
 
-    def k_inverse(self, u):
-        x_ddash1 = 1.0 / self.f1 * (u[:, 0] - self.c1)
-        x_ddash2 = 1.0 / self.f2 * (u[:, 1] - self.c2)
-        return np.stack([x_ddash1, x_ddash2], axis=1)
+        self.image_received = False  # Flag to check if image is received
+        self.camera_info_received = True  # Flag to check if camera info is received, set to true since we added default values
+        self.depth_image = None # Depth image
+        self.depth_encoding = None # Depth image encoding
 
-    def backproject(self, u):
-        x_ddash = self.k_inverse(u)
-        x_dash = self.d_inverse(x_ddash)
-        return self.p_inverse(x_dash)
+        # Subscribers
+        rospy.Subscriber("/camera/color/image_raw", Image, self.image_callback)
+        rospy.Subscriber("/camera/color/camera_info", CameraInfo, self.camera_info_callback)
+        rospy.Subscriber("/camera/depth/image_raw", Image, self.depth_callback) # Modified topic name
 
+        # Rate
+        self.rate = rospy.Rate(30)  # 30 Hz
 
-# now test with a projected cube
-b = 1.0  # sidelength
-z_distance = 2.0  # distance from the camera along the z-axis
-N = 20  # number of points on edge
+    def camera_info_callback(self, data):
+        """
+        Camera info callback function.
+        """
+        self.camera.from_camera_info(data)
+        self.distortion.from_camera_info(data)
 
-spacing = np.linspace(0, b, N).reshape(N, 1)
-e1 = np.array([-b / 2, -b / 2.0, -b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([1, 0, 0]).reshape(1, 3)
-)
-e2 = np.array([-b / 2, -b / 2.0, b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([1, 0, 0]).reshape(1, 3)
-)
-e3 = np.array([-b / 2, b / 2.0, -b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([1, 0, 0]).reshape(1, 3)
-)
-e4 = np.array([-b / 2, b / 2.0, b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([1, 0, 0]).reshape(1, 3)
-)
-e5 = np.array([b / 2, -b / 2.0, -b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([0, 1, 0]).reshape(1, 3)
-)
-e6 = np.array([b / 2, -b / 2.0, b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([0, 1, 0]).reshape(1, 3)
-)
-e7 = np.array([-b / 2, -b / 2.0, -b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([0, 1, 0]).reshape(1, 3)
-)
-e8 = np.array([-b / 2, -b / 2.0, b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([0, 1, 0]).reshape(1, 3)
-)
-e9 = np.array([b / 2, -b / 2.0, -b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([0, 0, 1]).reshape(1, 3)
-)
-e10 = np.array([b / 2, b / 2.0, -b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([0, 0, 1]).reshape(1, 3)
-)
-e11 = np.array([-b / 2, -b / 2.0, -b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([0, 0, 1]).reshape(1, 3)
-)
-e12 = np.array([-b / 2, b / 2.0, -b / 2.0 + z_distance]).reshape(1, 3) + spacing.dot(
-    np.array([0, 0, 1]).reshape(1, 3)
-)
-edges = np.concatenate([e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12], axis=0)
+        # Convert camera parameters to OpenCV format
+        self.camera_matrix = np.array(data.K).reshape((3, 3))
+        self.dist_coeffs = np.array(data.D)
 
-ax = plt.figure().add_subplot(projection="3d")
-ax.scatter(edges[:, 0], edges[:, 1], edges[:, 2])
-_ = ax.set_xlabel("x")
-_ = ax.set_ylabel("y")
-_ = ax.set_zlabel("z")
-plt.show(block=True)
+        # Refine camera matrix (optional, but often improves results)
+        image_width = data.width
+        image_height = data.height
+        self.new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(self.camera_matrix, self.dist_coeffs, (image_width, image_height), 1, (image_width, image_height))
 
-# create a plausible pinhole camera model, VGA resolution
-pinholeCamera = PinholeCamera(
-    640,
-    480,
-    450,
-    450,
-    319.5,
-    239.5,
-    RadialTangentialDistortion(-0.3, 0.1, -0.0001, -0.00005),
-)
+        # Precompute remap matrices
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(self.camera_matrix, self.dist_coeffs, None, self.new_camera_matrix, (image_width, image_height), cv2.CV_32FC1)
 
-u, is_valid = pinholeCamera.project(edges)
+        self.camera_info_received = True
+        rospy.loginfo("Camera info received and processed.")
 
-fig, ax = plt.subplots()
-ax.scatter(u[:, 0], u[:, 1])
-_ = ax.set_xlim(0, 640)
-_ = ax.set_ylim(0, 480)
-plt.show(block=True)
+    def depth_callback(self, data):
+        """
+        Depth image callback function.
+        """
+        try:
+            # Convert the depth image using CvBridge
+            self.depth_image = self.bridge.imgmsg_to_cv2(data, data.encoding)
+            self.depth_encoding = data.encoding
+            rospy.loginfo(f"Depth image encoding: {self.depth_encoding}")
+        except Exception as e:
+            rospy.logerr(f"Error converting depth image: {e}")
+            return
 
-# here is a unit test
-distortion = RadialTangentialDistortion(-0.3, 0.1, -0.0001, -0.00005)
-pinholeCamera = PinholeCamera(640, 480, 450, 450, 319.5, 239.5, distortion)
+    def undistort_image(self, image):
+        """
+        Undistorts the given image using precomputed remap matrices.
+        """
+        if self.map1 is None or self.map2 is None:
+            rospy.logwarn("Remap matrices not initialized. Returning original image.")
+            return image
 
-success = True
-for i in range(0, 1000):
-    # generate random visible point in image
-    u_1 = np.random.uniform(-0.49, 639.49)
-    u_2 = np.random.uniform(-0.49, 479.49)
-    # back-project and assign random distance
-    randomPoint = np.array([[u_1, u_2]])
-    ray = pinholeCamera.backproject(np.array([[u_1, u_2]]))
-    # project again
-    point, is_valid = pinholeCamera.project(ray)
-    # check the projection is the same as the generated initial image point
-    if np.linalg.norm(point - randomPoint) > 0.001:
-        success = False
-        break
+        undistorted_image = cv2.remap(image, self.map1, self.map2, cv2.INTER_LINEAR)
+        return undistorted_image
 
-if success:
-    print("[PASSED]")
-else:
-    print("[FAILED]")
+    def image_callback(self, data):
+        """
+        Image callback function.
+        """
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            self.image_received = True
+        except Exception as e:
+            rospy.logerr(f"Error converting image: {e}")
+            return
 
-# because we wrote the functions above in a way that they accept arrays of points,
-# we can do this unit test in a more elegant / Pythonic way, too:
-distortion = RadialTangentialDistortion(-0.3, 0.1, -0.0001, -0.00005)
-pinholeCamera = PinholeCamera(640, 480, 450, 450, 319.5, 239.5, distortion)
+        # Check if camera info has been received before proceeding
+        if not self.camera_info_received:
+            rospy.logwarn_throttle(10, "Waiting for camera info...") #only log once every 10 seconds
+            return
 
-# generate random visible point in image
-u_1 = np.random.uniform(-0.49, 639.49, size=1000)
-u_2 = np.random.uniform(-0.49, 479.49, size=1000)
-randomPoint = np.stack([u_1, u_2], axis=1)
+        # Undistort the image
+        undistorted_image = self.undistort_image(cv_image)
 
-# back-project and assign random distance
-ray = pinholeCamera.backproject(randomPoint)
+        # Object detection using YOLOv8
+        results = self.model.predict(undistorted_image, verbose=False)
 
-# project again
-point, is_valid = pinholeCamera.project(ray)
+        # Process the results
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                # Extract bounding box information
+                x1, y1, x2, y2 = box.xyxy[0]
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                confidence = float(box.conf[0])
+                class_id = int(box.cls[0])
 
-# check the projection is the same as the generated initial image point
-error = np.linalg.norm(point - randomPoint[is_valid], axis=1)
-assert np.all(error < 0.001)
+                # Get class name
+                class_name = result.names[class_id]
+
+                # Filter for "cup" detections (or any class you are interested in)
+                if class_name == "cup" and confidence > 0.7:  # Adjust confidence threshold as needed
+                    # Draw bounding box
+                    cv2.rectangle(undistorted_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f'{class_name}: {confidence:.2f}'
+                    cv2.putText(undistorted_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                    # Estimate depth (take depth from center of bounding box)
+                    center_x = (x1 + x2) // 2
+                    center_y = (y1 + y2) // 2
+
+                    # Check if depth image is available
+                    if self.depth_image is None:
+                        rospy.logwarn_throttle(10, "Depth image not yet received.")
+                        continue
+
+                    # Determine depth image dimensions
+                    height_depth, width_depth = self.depth_image.shape[:2]
+
+                    # Project center point to depth image coordinates (assuming they are aligned)
+                    center_x_depth = int(center_x)
+                    center_y_depth = int(center_y)
+
+                    # Ensure valid depth image coordinates
+                    if 0 <= center_x_depth < width_depth and 0 <= center_y_depth < height_depth:
+                        depth_value = self.depth_image[center_y_depth, center_x_depth]
+                        if np.isnan(depth_value) or depth_value <= 0.001:  # Check for NaN or near-zero values
+                            depth_value = -1 #consider depth value invalid
+                        #rospy.loginfo(f"Type of depth value: {type(depth_value)}") #debugging code
+                    else:
+                        depth_value = -1  # Invalid depth
+
+                    if depth_value > 0:
+                        rospy.loginfo(f"Depth of {class_name} at ({center_x}, {center_y}): {depth_value:.3f}")
+                    else:
+                        rospy.loginfo(f"Depth of {class_name} at ({center_x}, {center_y}): Invalid")
+
+        # Display the resulting image
+        cv2.imshow("Object Detection with Depth", undistorted_image)
+        cv2.waitKey(1)
+
+    def run(self):
+        """
+        Main loop.
+        """
+        while not rospy.is_shutdown():
+            self.rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        estimator = ObjectDepthEstimator()
+        estimator.run()
+    except rospy.ROSInterruptException:
+        pass
