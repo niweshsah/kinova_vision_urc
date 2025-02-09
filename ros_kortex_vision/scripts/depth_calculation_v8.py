@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import rospy
+from std_msgs.msg import String
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 import cv2
@@ -84,6 +85,13 @@ class YOLOv8ROSNode:
                                              (u_rgb, v_rgb), 
                                              (u_depth, v_depth), 
                                              depth_value, x, y, z)
+                        
+                        # #send the coordinates of the bounding box to the robot via rostopic for class 41 with z value
+                        # if cls == 41:
+                        #     bounding_box = (x1, y1, x2, y2,z)
+                        #     coordinates_msg = f"{bounding_box[0]},{bounding_box[1]},{bounding_box[2]},{bounding_box[3], bounding_box[4]}"
+                        #     rospy.Publisher('/robot/coordinates', String, queue_size=10).publish(coordinates_msg) 
+
             
             self.publish_and_display(rendered_image, depth_vis)
         
