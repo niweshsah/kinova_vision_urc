@@ -41,7 +41,7 @@ def init_node():
     bridge = CvBridge()
 
     # Get label ID parameter
-    label_id = rospy.get_param('~label_id', default=39)  # Default to bottle
+    label_id = rospy.get_param('~label_id', default=None)  # Default to bottle
     rospy.loginfo(f"Filtering detections for label ID: {label_id}")
 
     # Initialize TF2
@@ -109,6 +109,9 @@ def draw_detections(image, bbox, center, world_coords, class_label):
 
     cv2.putText(image, f"{class_label}", (bbox[0], bbox[1] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+    
+    if not world_coords:
+        rospy.loginfo(f"World coordinates not available for {class_label}")
 
     if world_coords:
         x_world, y_world, z_world = world_coords
