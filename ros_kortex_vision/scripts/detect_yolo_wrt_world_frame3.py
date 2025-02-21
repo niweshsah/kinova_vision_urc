@@ -4,7 +4,7 @@ import rospy
 import tf2_ros
 import tf2_geometry_msgs
 import cv2
-import torch
+# import torch
 import numpy as np
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
@@ -41,7 +41,7 @@ def init_node():
     bridge = CvBridge()
 
     # Get label ID parameter
-    label_id = rospy.get_param('~label_id', default=None)  # Default to bottle
+    label_id = rospy.get_param('~label_id', default=39)  # Default to bottle
     rospy.loginfo(f"Filtering detections for label ID: {label_id}")
 
     # Initialize TF2
